@@ -1,0 +1,298 @@
+---
+title: "Final project for Math 390 Data Science at Queens College"
+author: "Jianing Guo"
+date: "5/18/2020"
+output:
+  word_document: default
+  html_document: default
+---
+In collaboration with:
+[Remessa]
+[Arnob]
+[Christella]
+
+
+```{r setup, include = TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+
+```{r}
+pkgs <- c('tidyverse', 'dplyr', 'tidyr', 'ggplot2', 'magrittr', 'stringr', 'mlr', 'sjmisc', 'missForest',
+          'rsample', 'rpart', 'rpart.plot', 'ipred', 'caret')
+for(p in pkgs) suppressPackageStartupMessages(stopifnot(
+  library(p, quietly=TRUE,
+          logical.return=TRUE,
+          character.only=TRUE)))
+```
+
+# Loading data 
+
+```{r }
+housing_data <- read.csv("housing_data_2016_2017.csv")
+```
+# Remove features that will not be used and cleaning data
+```{r}
+dat <- housing_data %>%
+  select(-c(HITId, HITTypeId, Title, Description, Keywords, Reward, CreationTime, MaxAssignments,	RequesterAnnotation,	AssignmentDurationInSeconds,	AutoApprovalDelayInSeconds,	Expiration,	NumberOfSimilarHITs, LifetimeInSeconds,	AssignmentId,	WorkerId,	AssignmentStatus,	AcceptTime,	SubmitTime,	AutoApprovalTime,	ApprovalTime,	RejectionTime,	RequesterFeedback,	WorkTimeInSeconds, LifetimeApprovalRate,	Last30DaysApprovalRate,	Last7DaysApprovalRate, URL, url, date_of_sale))
+
+dat.2 <- dat %>%
+  mutate(zip_code = str_extract(full_address_or_zip_code, "[0-9]{5}"), #extract 5-digit zipcode
+         pets_allowed = ifelse((substr(cats_allowed, 1, 3) == "yes")|(substr(dogs_allowed, 1, 3) == "yes"), 1, 0),
+          ) %>%
+  select(-c(dogs_allowed,cats_allowed))#delete unwanted variables
+```
+
+## convert currency columns into numeric for later calculation
+```{r}
+dat.2$maintenance_cost <- as.numeric(gsub('\\$|,', '', dat.2$maintenance_cost))
+dat.2$common_charges <- as.numeric(gsub('\\$|,', '', dat.2$common_charges))
+dat.2$parking_charges <- as.numeric(gsub('\\$|,', '', dat.2$parking_charges))
+dat.2$listing_price_to_nearest_1000 <- as.numeric(gsub('\\$|,', '', dat.2$listing_price_to_nearest_1000))
+dat.2$total_taxes <- as.numeric(gsub('\\$|,', '', dat.2$total_taxes))
+dat.2$sale_price <- as.numeric(gsub('\\$|,', '', dat.2$sale_price))
+```
+## Use functions from sjmisc package to recode variables
+```{r}
+dat.3 <- dat.2 %>%
+  # recode all NAs with 0, and keep all others the same
+  mutate(maintenance_cost = rec(maintenance_cost, rec = "NA = 0 ; else = copy"),
+         common_charges = rec(common_charges, rec = "NA = 0 ; else = copy"),
+         # create a new variable monthly_cost to combine both costs
+         monthly_cost = common_charges + maintenance_cost,
+         # recode monthly_cost in case there's any NA
+         monthly_cost = rec(monthly_cost, rec = "0 = NA ; else = copy"),
+         # use rec function to recode garage exists variable
+         garage_exists = rec(garage_exists, rec = "NA = 0 ; else = copy"),
+         # garage exists variable needs further cleaning
+         garage_exists = rec(garage_exists, rec = "NA = 0; eys , UG , Underground , yes , Yes = 1 ; else = copy"),
+         garage_exists = as.factor(garage_exists),
+         #use rec function to recode kitchen type
+         kitchen_type = rec(kitchen_type, rec = "NA, none, 1955 = 0; combo, Combo = 1; eat in, Eat in,  Eat In, eatin = 2; efficiemcy, efficiency,  efficiency kitchen, efficiency kitchene, efficiency ktchen = 3; else = copy"),
+         kitchen_type = as.factor(kitchen_type),
+         # take care of some variable types
+         dining_room_type = as.factor(dining_room_type),
+         price_persqft = listing_price_to_nearest_1000 *1.0/ sq_footage,  # sq_footage has NA??
+         coop_condo = as.factor(tolower(coop_condo)),
+         total_taxes = ifelse(total_taxes < 1000, NA, total_taxes)
+         ) %>%
+  # remove features that will not be used
+  select(-c(maintenance_cost , common_charges, model_type, fuel_type, zip_code, full_address_or_zip_code, listing_price_to_nearest_1000))
+
+```
+
+## Do more data cleaning
+```{r}
+dat.3 %<>%
+  # create a ID column
+  mutate(id = 1 : nrow(dat.3)) %>%
+  # move id column to the first
+  select(id, everything())
+summary(dat.3)
+str(dat.3)
+```
+## Construct tables for modeling
+```{r}
+real_y <- data.frame(dat.3$id, dat.3$sale_price)
+real_dat <- subset(dat.3, (!is.na(dat.3$sale_price)))
+fake_dat <- subset(dat.3, (is.na(dat.3$sale_price)))
+real_dat$sale_price <- NULL
+fake_dat$sale_price <- NULL
+
+```
+# 80/20 split on training and testing
+```{r}
+train_indices <- sample(1 : nrow(real_dat), nrow(real_dat)*0.8)
+training_data <- real_dat[train_indices, ]
+testing_data <- real_dat[-train_indices, ]
+X <- rbind(training_data, testing_data, fake_dat)
+```
+
+## Create a table to store columns with missing data
+```{r}
+m_d <- tbl_df(apply(is.na(X), 2, as.numeric))
+colnames(m_d) <- paste("is_missing_", colnames(X), sep = "")
+# remove duplicated rows
+m_d <- tbl_df(t(unique(t(m_d))))
+# remove rows where there is no missing data
+m_d %<>% select_if(function(x){sum(x) > 0})
+
+```
+# Data imputation
+```{r}
+Ximp <- missForest(data.frame(X), sampsize = rep(172, ncol(X)))$ximp
+Ximp %<>%
+  arrange(id)
+```
+## Table with imputed data filled in
+```{r}
+Xnew <- data.frame(cbind(Ximp, m_d, real_y))
+Xnew %<>%
+  mutate(price = dat.3.sale_price) %>%
+  select(-c(id, dat.3.id, dat.3.sale_price))
+```
+
+```{r}
+linear_mod_impute_and_missing_dummies <- lm(price ~ ., data = Xnew)
+summary(linear_mod_impute_and_missing_dummies)
+
+```
+
+## Take care of missing y
+```{r}
+Data <- Xnew
+# use imputed y to fill in sales price
+Y <- Data$price
+Data %<>%
+  filter(!is.na(price)) %>%
+  select(-price)
+# 422: length of 80
+Xtrain <- Data[1:422, ]
+# real data row = 528
+Xtest <- Data[423:528, ]
+Ytrain <- Y[1:422]
+Ytest <- Y[423:528]
+```
+
+## Combine x/y train and x/y test
+```{r}
+dtrain <- cbind(Xtrain, Ytrain)
+dtest <- cbind(Xtest, Ytest)
+```
+## Remove colinear features
+```{r}
+Xtrain %<>%
+  select(-c(is_missing_num_total_rooms, is_missing_num_bedrooms, is_missing_price_persqft))
+```
+
+## Simple linear regression
+```{r}
+linear <- lm(Ytrain ~ ., data = Xtrain)
+summary(linear)
+
+```
+
+## Make prediction，residuals，r^2
+```{r}
+yhat <- predict(linear, Xtest)
+e <- yhat - Ytest
+sqrt(sum(e^2) / nrow(Xtest))
+
+```
+# Regression tree mod 1
+
+```{r}
+mod1 <- rpart(formula = Ytrain ~ .,
+  data    = Xtrain,
+  method  = "anova"
+)
+rpart.plot(mod1)
+plotcp(mod1)
+summary(mod1)
+yhat <- predict(mod1, Xtest)
+e <- yhat - Ytest
+# 106: length of testing table
+sqrt(sum(e^2)/106)
+```
+###mode 2
+```{r}
+
+
+mod2 <- rpart(
+  formula = Ytrain ~ .,
+  data    = Xtrain,
+  method  = "anova", 
+  control = list(cp = 0, xval = 10)
+)
+rpart.plot(mod2)
+plotcp(mod2)
+summary(mod2)
+yhat2 <- predict(mod2, Xtest)
+e2 <- yhat2 - Ytest
+sqrt(sum(e2^2)/106)
+
+
+```
+
+## Tuning
+```{r}
+mod3 <- rpart(
+  formula = Ytrain ~ .,
+  data    = Xtrain,
+  method  = "anova", 
+  control = list(minsplit = 10, maxdepth = 12, xval = 10)
+)
+yhat3 <- predict(mod3, Xtest)
+summary(mod3)
+e3 <- yhat3 - Ytest
+sqrt(sum(e3^2)/106)
+mod3$cptable
+rpart.plot(mod3)
+```
+
+## Define function to get optimal cp and minimum error
+```{r}
+get_cp <- function(x) {
+  min    <- which.min(x$cptable[, "xerror"])
+  cp <- x$cptable[min, "CP"] 
+}
+get_min_error <- function(x) {
+  min    <- which.min(x$cptable[, "xerror"])
+  xerror <- x$cptable[min, "xerror"] 
+}
+
+```
+## Get optimal tree
+```{r}
+optimal_tree <- rpart(
+  formula = Ytrain ~ .,
+  data    = Xtrain,
+  method  = "anova",
+  control = list(minsplit = 11, maxdepth = 8, cp = 0.01)
+)
+summary(optimal_tree)
+pred <- predict(optimal_tree, newdata = Xtrain)
+RMSE(pred = pred, obs = Ytrain)
+Tss = RMSE(pred = Ytrain, obs = mean(Ytrain))
+ 1-RMSE(pred = pred, obs = Ytrain)/Tss
+rpart.plot(optimal_tree)
+
+```
+
+
+# Random forest
+```{r}
+r_f1 <- randomForest(
+  formula = Ytrain ~ .,
+  data    = Xtrain
+)
+r_f1
+# print min mse index
+which.min(r_f1$mse)
+# RMSE of this optimal random forest
+sqrt(r_f1$mse[which.min(r_f1$mse)])
+
+features <- setdiff(names(Xtrain), Ytrain)
+set.seed(1988)
+r_f2 <- tuneRF(
+  x          = Xtrain,
+  y          = Ytrain,
+  ntreeTry   = 500,
+  mtryStart  = 5,
+  stepFactor = 1.5,
+  improve    = 0.01,
+  trace      = FALSE     
+)
+```
+
+
+
+
+
+
+
+
+
+
+End
